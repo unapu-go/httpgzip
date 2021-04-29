@@ -131,6 +131,12 @@ var gzipBufPool = sync.Pool{
 }
 
 // A GzReader
+type GzipedReader interface {
+	io.Reader
+	Gziped() (bool, error)
+}
+
+// A GzReader
 type GzReader interface {
 	io.Reader
 	GzipReader() (io.Reader, error)
@@ -147,6 +153,10 @@ func NewGzReader(reader io.Reader, r func() (io.Reader, error)) GzReader {
 
 func (g *gzReader) GzipReader() (io.Reader, error) {
 	return g.reader()
+}
+
+func (g *gzReader) Gziped() (bool, error) {
+	return true, nil
 }
 
 // A gzipResponseWriter is a modified http.ResponseWriter. It adds
