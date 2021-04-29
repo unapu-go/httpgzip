@@ -44,7 +44,9 @@ package httpgzip
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"io"
 	"mime"
 	"net/http"
 	"strconv"
@@ -107,8 +109,8 @@ var gzipWriterPools = map[int]*sync.Pool{}
 
 func init() {
 	levels := map[int]struct{}{
-		DefaultCompression: struct{}{},
-		NoCompression:      struct{}{},
+		DefaultCompression: {},
+		NoCompression:      {},
 	}
 	for i := BestSpeed; i <= BestCompression; i++ {
 		levels[i] = struct{}{}
@@ -128,6 +130,25 @@ var gzipBufPool = sync.Pool{
 	New: func() interface{} { return new(bytes.Buffer) },
 }
 
+// A GzReader
+type GzReader interface {
+	io.Reader
+	GzipReader() (io.Reader, error)
+}
+
+type gzReader struct {
+	io.Reader
+	reader func() (io.Reader, error)
+}
+
+func NewGzReader(reader io.Reader, r func() (io.Reader, error)) GzReader {
+	return &gzReader{reader, r}
+}
+
+func (g *gzReader) GzipReader() (io.Reader, error) {
+	return g.reader()
+}
+
 // A gzipResponseWriter is a modified http.ResponseWriter. It adds
 // gzip compression to certain responses, and there are two cases
 // where this is done. Case 1 is when encs only allows gzip encoding
@@ -145,12 +166,14 @@ var gzipBufPool = sync.Pool{
 // compression level of level.
 type gzipResponseWriter struct {
 	http.ResponseWriter
-	httpStatus int
-	ctMap      map[string]struct{}
-	encs       []encoding
-	level      int
-	gw         *gzip.Writer
-	buf        *bytes.Buffer
+	httpStatus  int
+	ctMap       map[string]struct{}
+	encs        []encoding
+	level       int
+	gw          *gzip.Writer
+	buf         *bytes.Buffer
+	compressed  bool
+	initialized bool
 }
 
 func newGzipResponseWriter(w http.ResponseWriter, ctMap map[string]struct{}, encs []encoding, level int) *gzipResponseWriter {
@@ -173,6 +196,11 @@ func newGzipResponseWriter(w http.ResponseWriter, ctMap map[string]struct{}, enc
 // appropriate headers are set and the ResponseWriter's WriteHeader
 // method is called.
 func (w *gzipResponseWriter) init() {
+	if w.initialized {
+		return
+	}
+	w.initialized = true
+
 	cth := w.Header().Get("Content-Type")
 	var ct string
 	if cth != "" {
@@ -187,25 +215,35 @@ func (w *gzipResponseWriter) init() {
 		}
 	}
 	var useGzip bool
-	if w.Header().Get("Content-Encoding") == "" && w.encs[0] == encGzip {
-		if gzipContentType && w.buf.Len() >= 512 || len(w.encs) == 1 {
-			useGzip = true
+	if w.compressed {
+		w.Header().Set("Content-Encoding", "gzip")
+	} else {
+		if w.Header().Get("Content-Encoding") == "" && w.encs[0] == encGzip {
+			if gzipContentType && w.buf.Len() >= 512 || len(w.encs) == 1 {
+				useGzip = true
+			}
+		}
+		if useGzip {
+			w.gw = gzipWriterPools[w.level].Get().(*gzip.Writer)
+			w.gw.Reset(w.ResponseWriter)
+			w.Header().Del("Content-Length")
+			w.Header().Set("Content-Encoding", "gzip")
 		}
 	}
-	if useGzip {
-		w.gw = gzipWriterPools[w.level].Get().(*gzip.Writer)
-		w.gw.Reset(w.ResponseWriter)
-		w.Header().Del("Content-Length")
-		w.Header().Set("Content-Encoding", "gzip")
-	}
 	w.Header().Del("Accept-Ranges")
+
 	if cth == "" {
 		w.Header().Set("Content-Type", ct)
 	}
+
 	w.ResponseWriter.WriteHeader(w.httpStatus)
 }
 
 func (w *gzipResponseWriter) Write(p []byte) (int, error) {
+	if w.compressed {
+		w.init()
+		return w.ResponseWriter.Write(p)
+	}
 	var n, written int
 	var err error
 	if w.buf != nil {
@@ -396,9 +434,37 @@ func NewHandlerLevel(h http.Handler, contentTypes []string, level int) (http.Han
 			r.Header.Del("Range")
 			// create new ResponseWriter
 			w = newGzipResponseWriter(w, ctMap, encs, level)
+			r = r.WithContext(context.WithValue(r.Context(), WriterContextKey, w))
 			defer w.(*gzipResponseWriter).Close()
 		}
 		// call original handler's ServeHTTP
 		h.ServeHTTP(w, r)
 	}), nil
+}
+
+type contextKey string
+
+const WriterContextKey contextKey = "writer"
+
+// GetWriter return writer of request.
+func GetWriter(r *http.Request) *gzipResponseWriter {
+	if value := r.Context().Value(WriterContextKey); value != nil {
+		return value.(*gzipResponseWriter)
+	}
+	return nil
+}
+
+// Gzipped allow to writes raw gziped contents to response writer.
+func Gzipped(r *http.Request) {
+	if w := GetWriter(r); r != nil {
+		w.compressed = true
+	}
+}
+
+// Accepts returns if response accept gzip.
+//
+// This function check request context to detect if gzipResponseWriter is initialized on
+// gziped Handler.
+func Accepts(r *http.Request) bool {
+	return GetWriter(r) != nil
 }
